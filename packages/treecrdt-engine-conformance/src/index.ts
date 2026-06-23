@@ -1,6 +1,11 @@
 import type { MaterializationEvent, TreecrdtEngine } from '@treecrdt/interface/engine';
 import type { Operation, ReplicaId } from '@treecrdt/interface';
-import { edits, type RedoResult, type UndoResult } from '@treecrdt/interface/edits';
+import {
+  EditConflictError,
+  edits,
+  type RedoResult,
+  type UndoResult,
+} from '@treecrdt/interface/edits';
 import { bytesToHex, nodeIdToBytes16, replicaIdToBytes } from '@treecrdt/interface/ids';
 import type { SqliteRunner } from '@treecrdt/interface/sqlite';
 
@@ -156,6 +161,10 @@ export function treecrdtEngineConformanceScenarios(): TreecrdtEngineConformanceS
     {
       name: 'local undo: imported ops survive history undo/redo',
       run: scenarioLocalUndoImportedOpsSurvive,
+    },
+    {
+      name: 'local undo: safe mode rejects changed payload',
+      run: scenarioLocalUndoSafeModeRejectsChangedPayload,
     },
     {
       name: 'append/appendMany: idempotent + headLamport monotonic',
@@ -1120,7 +1129,7 @@ async function scenarioLocalUndoImportedOpsSurvive(
     'imported undo remote payload after sync',
   );
 
-  const undone = await edits.undo(historyA, rA, captured);
+  const undone = await edits.undo(historyA, rA, captured, { mode: 'safe' });
   assertArrayEqual(
     await a.tree.children(parentA),
     [target, remoteSibling],
@@ -1160,7 +1169,7 @@ async function scenarioLocalUndoImportedOpsSurvive(
     'imported undo peer remote payload survives undo',
   );
 
-  await edits.redo(a, rA, undone);
+  await edits.redo(a, rA, undone, { mode: 'safe' });
   assertArrayEqual(
     await a.tree.children(parentA),
     [remoteSibling],
@@ -1198,6 +1207,76 @@ async function scenarioLocalUndoImportedOpsSurvive(
     await b.tree.getPayload(remoteSibling),
     remotePayload,
     'imported undo peer remote payload survives redo',
+  );
+}
+
+async function scenarioLocalUndoSafeModeRejectsChangedPayload(
+  ctx: TreecrdtEngineConformanceContext,
+): Promise<void> {
+  const a = ctx.engine;
+  if (!a.history) return;
+  const historyA = a as typeof a & { history: NonNullable<typeof a.history> };
+  const b = await ctx.createEngine({ docId: ctx.docId, name: 'peer-b' });
+
+  const rA = replicaFromLabel('rA');
+  const rB = replicaFromLabel('rB');
+  const root = nodeIdFromInt(0);
+  const node = nodeIdFromInt(181);
+  const textEncoder = new TextEncoder();
+  const originalPayload = textEncoder.encode('safe-original');
+  const localPayload = textEncoder.encode('safe-local');
+  const remotePayload = textEncoder.encode('safe-remote');
+
+  await a.local.insert(rA, root, node, { type: 'last' }, originalPayload);
+  await b.ops.appendMany(await a.ops.all());
+
+  const captured = await edits.capture(a, rA, async (local) => local.payload(node, localPayload));
+  assertBytesEqual(
+    await a.tree.getPayload(node),
+    localPayload,
+    'safe changed payload after local capture',
+  );
+
+  await b.ops.appendMany(await a.ops.all());
+  await b.local.payload(rB, node, remotePayload);
+  await a.ops.appendMany(await b.ops.all());
+  assertBytesEqual(
+    await a.tree.getPayload(node),
+    remotePayload,
+    'safe changed payload after remote write',
+  );
+
+  const opCountBeforeSafeUndo = (await a.ops.all()).length;
+  let sawSafeConflict = false;
+  try {
+    await edits.undo(historyA, rA, captured, { mode: 'safe' });
+  } catch (err) {
+    assert(err instanceof EditConflictError, 'safe changed payload should throw edit conflict');
+    sawSafeConflict = true;
+    assertArrayEqual(
+      err.conflicts.map((conflict) => conflict.reason),
+      ['payload'],
+      'safe changed payload conflict reasons',
+    );
+  }
+  assert(sawSafeConflict, 'safe changed payload should reject undo');
+  assertEqual(
+    (await a.ops.all()).length,
+    opCountBeforeSafeUndo,
+    'safe changed payload should not write undo ops',
+  );
+  assertBytesEqual(
+    await a.tree.getPayload(node),
+    remotePayload,
+    'safe changed payload should leave remote payload visible',
+  );
+
+  const forcedUndo = await edits.undo(historyA, rA, captured, { mode: 'force' });
+  assertEqual(forcedUndo.operations.length, 1, 'force changed payload undo operation count');
+  assertBytesEqual(
+    await a.tree.getPayload(node),
+    originalPayload,
+    'force changed payload restores captured original payload',
   );
 }
 

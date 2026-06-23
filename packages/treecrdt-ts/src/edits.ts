@@ -53,10 +53,12 @@ export type Captured<T> = {
 export type { OperationEdit };
 
 export type Undoable = {
+  operations?: Operation[];
   undo: Plan;
 };
 
 export type Redoable = {
+  operations?: Operation[];
   redo: Plan;
 };
 
@@ -70,8 +72,153 @@ export type RedoResult = {
   undo: Plan;
 };
 
+export type EditMode = 'force' | 'safe';
+
+export type EditOptions = LocalWriteOptions & {
+  /**
+   * `force` always applies inverse operations. `safe` first checks that the current visible state
+   * still matches the state produced by the captured edit, and rejects without writing on conflict.
+   */
+  mode?: EditMode;
+};
+
+export type EditConflictReason = 'exists' | 'parent' | 'orderKey' | 'payload';
+
+export type EditConflict = {
+  node: string;
+  reason: EditConflictReason;
+};
+
+export class EditConflictError extends Error {
+  readonly conflicts: EditConflict[];
+
+  constructor(action: 'undo' | 'redo', conflicts: EditConflict[]) {
+    super(`treecrdt: ${action} safe mode conflict`);
+    this.name = 'EditConflictError';
+    this.conflicts = conflicts;
+  }
+}
+
 function cloneBytes(bytes: Uint8Array | null): Uint8Array | null {
   return bytes === null ? null : new Uint8Array(bytes);
+}
+
+function bytesEqual(a: Uint8Array | null | undefined, b: Uint8Array | null | undefined): boolean {
+  if (a === null || a === undefined || b === null || b === undefined) return a === b;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+type ExpectedPostState = {
+  exists?: boolean;
+  parent?: string;
+  orderKey?: Uint8Array;
+  payload?: Uint8Array | null;
+};
+
+function expectedPostStates(operations: Operation[]): Map<string, ExpectedPostState> {
+  const states = new Map<string, ExpectedPostState>();
+  const stateFor = (node: string) => {
+    let state = states.get(node);
+    if (!state) {
+      state = {};
+      states.set(node, state);
+    }
+    return state;
+  };
+
+  for (const op of operations) {
+    const kind = op.kind;
+    switch (kind.type) {
+      case 'insert': {
+        const state = stateFor(kind.node);
+        state.exists = true;
+        state.parent = kind.parent;
+        state.orderKey = kind.orderKey;
+        state.payload = kind.payload === undefined ? null : cloneBytes(kind.payload);
+        break;
+      }
+      case 'move': {
+        const state = stateFor(kind.node);
+        state.exists = true;
+        state.parent = kind.newParent;
+        state.orderKey = kind.orderKey;
+        break;
+      }
+      case 'delete':
+      case 'tombstone': {
+        const state = stateFor(kind.node);
+        state.exists = false;
+        delete state.parent;
+        delete state.orderKey;
+        delete state.payload;
+        break;
+      }
+      case 'payload': {
+        const state = stateFor(kind.node);
+        state.exists = true;
+        state.payload = cloneBytes(kind.payload);
+        break;
+      }
+    }
+  }
+
+  return states;
+}
+
+function splitEditOptions(opts?: EditOptions): {
+  mode: EditMode;
+  writeOptions?: LocalWriteOptions;
+} {
+  if (!opts) return { mode: 'force' };
+  const { mode = 'force', ...writeOptions } = opts;
+  return { mode, writeOptions };
+}
+
+function editOperations(edit: { operations?: Operation[] }): Operation[] {
+  if (edit.operations) return edit.operations;
+  throw new Error('treecrdt: safe edit mode requires captured operations');
+}
+
+async function assertSafePostState(
+  target: Target,
+  operations: Operation[],
+  action: 'undo' | 'redo',
+): Promise<void> {
+  const expected = expectedPostStates(operations);
+  const rowsByNode = new Map((await target.tree.dump()).map((row) => [row.node, row]));
+  const conflicts: EditConflict[] = [];
+
+  for (const [node, state] of expected) {
+    const row = rowsByNode.get(node);
+    const actualExists = row != null && !row.tombstone;
+
+    if (state.exists !== undefined && actualExists !== state.exists) {
+      conflicts.push({ node, reason: 'exists' });
+      continue;
+    }
+    if (!actualExists) continue;
+
+    if (state.parent !== undefined && row?.parent !== state.parent) {
+      conflicts.push({ node, reason: 'parent' });
+    }
+    if (state.orderKey !== undefined && !bytesEqual(row?.orderKey, state.orderKey)) {
+      conflicts.push({ node, reason: 'orderKey' });
+    }
+    if (state.payload !== undefined) {
+      const actualPayload = await target.tree.getPayload(node);
+      if (!bytesEqual(actualPayload, state.payload)) {
+        conflicts.push({ node, reason: 'payload' });
+      }
+    }
+  }
+
+  if (conflicts.length > 0) {
+    throw new EditConflictError(action, conflicts);
+  }
 }
 
 async function visiblePlacementBefore(
@@ -232,26 +379,32 @@ export async function undo(
   target: HistoryTarget,
   replica: ReplicaId,
   edit: OperationEdit,
-  opts?: LocalWriteOptions,
+  opts?: EditOptions,
 ): Promise<UndoResult>;
 export async function undo(
   target: Target,
   replica: ReplicaId,
   edit: Undoable,
-  opts?: LocalWriteOptions,
+  opts?: EditOptions,
 ): Promise<UndoResult>;
 export async function undo(
   target: Target | HistoryTarget,
   replica: ReplicaId,
   edit: OperationEdit | Undoable,
-  opts?: LocalWriteOptions,
+  opts?: EditOptions,
 ): Promise<UndoResult> {
+  const { mode, writeOptions } = splitEditOptions(opts);
+  if (mode === 'safe') {
+    await assertSafePostState(target, editOperations(edit), 'undo');
+  }
   const undo =
     'undo' in edit ? edit.undo : await (target as Partial<HistoryTarget>).history?.invert(edit);
   if (!undo) {
     throw new Error('treecrdt: history inversion is not implemented by this engine');
   }
-  const applied = await capturePlan(target, replica, (local) => applyToLocal(local, undo, opts));
+  const applied = await capturePlan(target, replica, (local) =>
+    applyToLocal(local, undo, writeOptions),
+  );
   return { operations: applied.operations, redo: applied.undo };
 }
 
@@ -259,10 +412,14 @@ export async function redo(
   target: Target,
   replica: ReplicaId,
   edit: Redoable,
-  opts?: LocalWriteOptions,
+  opts?: EditOptions,
 ): Promise<RedoResult> {
+  const { mode, writeOptions } = splitEditOptions(opts);
+  if (mode === 'safe') {
+    await assertSafePostState(target, editOperations(edit), 'redo');
+  }
   const applied = await capturePlan(target, replica, (local) =>
-    applyToLocal(local, edit.redo, opts),
+    applyToLocal(local, edit.redo, writeOptions),
   );
   return { operations: applied.operations, undo: applied.undo };
 }
